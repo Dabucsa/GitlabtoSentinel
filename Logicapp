@@ -1,0 +1,424 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "parameters": {
+            "keyVaultName": {
+                "type": "string",
+                "defaultValue": "gitlab-audit-kv-UNIQUEID"
+            },
+            "tokenSecretName": {
+                "type": "string",
+                "defaultValue": "gitlabaudit-token"
+            },
+            "checkpointSecretName": {
+                "type": "string",
+                "defaultValue": "gitlabaudit-lasttime"
+            },
+            "gitlabGroupId": {
+                "type": "string",
+                "defaultValue": "116948591"
+            },
+            "dcrEndpoint": {
+                "type": "string",
+                "defaultValue": "https://REEMPLAZAR.ingest.monitor.azure.com"
+            },
+            "dcrImmutableId": {
+                "type": "string",
+                "defaultValue": "dcr-REEMPLAZAR"
+            },
+            "streamName": {
+                "type": "string",
+                "defaultValue": "Custom-gitlabaudit_CL"
+            }
+        },
+        "actions": {
+            "Get_GitLab_Token": {
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://@{parameters('keyVaultName')}.vault.azure.net/secrets/@{parameters('tokenSecretName')}?api-version=7.4",
+                    "method": "GET",
+                    "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://vault.azure.net"
+                    }
+                },
+                "runAfter": {}
+            },
+            "Get_LastTime": {
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://@{parameters('keyVaultName')}.vault.azure.net/secrets/@{parameters('checkpointSecretName')}?api-version=7.4",
+                    "method": "GET",
+                    "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://vault.azure.net"
+                    }
+                },
+                "runAfter": {
+                    "Get_GitLab_Token": ["SUCCEEDED"]
+                }
+            },
+            "Init_GitLab_Token": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "GitLabToken",
+                            "type": "string",
+                            "value": "@{body('Get_GitLab_Token')['value']}"
+                        }
+                    ]
+                },
+                "runAfter": {
+                    "Get_GitLab_Token": ["SUCCEEDED"]
+                }
+            },
+            "Init_LastTime": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "LastTime",
+                            "type": "string",
+                            "value": "@{coalesce(body('Get_LastTime')['value'], '2020-01-01T00:00:00Z')}"
+                        }
+                    ]
+                },
+                "runAfter": {
+                    "Get_LastTime": ["SUCCEEDED"]
+                }
+            },
+            "Init_Page": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "page",
+                            "type": "integer",
+                            "value": 1
+                        }
+                    ]
+                },
+                "runAfter": {
+                    "Init_LastTime": ["SUCCEEDED"]
+                }
+            },
+            "Init_NextPage": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "nextPage",
+                            "type": "string",
+                            "value": "1"
+                        }
+                    ]
+                },
+                "runAfter": {
+                    "Init_Page": ["SUCCEEDED"]
+                }
+            },
+            "Init_FatalError": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "fatalError",
+                            "type": "string",
+                            "value": ""
+                        }
+                    ]
+                },
+                "runAfter": {
+                    "Init_NextPage": ["SUCCEEDED"]
+                }
+            },
+            "Init_MaxTime": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "maxTime",
+                            "type": "string",
+                            "value": "@{variables('LastTime')}"
+                        }
+                    ]
+                },
+                "runAfter": {
+                    "Init_FatalError": ["SUCCEEDED"]
+                }
+            },
+            "Until_Paginate": {
+                "type": "Until",
+                "expression": "@equals(variables('nextPage'), '')",
+                "limit": {
+                    "count": 500,
+                    "timeout": "PT15M"
+                },
+                "actions": {
+                    "GitLab_Request": {
+                        "type": "Http",
+                        "inputs": {
+                            "uri": "https://gitlab.com/api/v4/groups/@{parameters('gitlabGroupId')}/audit_events?per_page=200&page=@{string(variables('page'))}&created_after=@{variables('LastTime')}",
+                            "method": "GET",
+                            "headers": {
+                                "PRIVATE-TOKEN": "@{variables('GitLabToken')}"
+                            },
+                            "timeout": "PT30S",
+                            "retryPolicy": {
+                                "type": "exponential",
+                                "count": 4,
+                                "interval": "PT10S"
+                            }
+                        }
+                    },
+                    "On_Http_Failed": {
+                        "type": "SetVariable",
+                        "inputs": {
+                            "name": "fatalError",
+                            "value": "@{concat('HTTP failed calling GitLab. Details: ', string(outputs('GitLab_Request')?['body']))}"
+                        },
+                        "runAfter": {
+                            "GitLab_Request": ["FAILED"]
+                        }
+                    },
+                    "Stop_On_Failed": {
+                        "type": "SetVariable",
+                        "inputs": {
+                            "name": "nextPage",
+                            "value": "''"
+                        },
+                        "runAfter": {
+                            "On_Http_Failed": ["SUCCEEDED"]
+                        }
+                    },
+                    "If_Http_BadStatus": {
+                        "type": "If",
+                        "expression": "@greaterOrEquals(outputs('GitLab_Request')?['statusCode'], 400)",
+                        "actions": {
+                            "Set_FatalError_On_BadStatus": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "fatalError",
+                                    "value": "@{concat('GitLab returned status ', string(outputs('GitLab_Request')?['statusCode']), '. Body: ', string(outputs('GitLab_Request')?['body']))}"
+                                }
+                            },
+                            "Stop_On_BadStatus": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "nextPage",
+                                    "value": "''"
+                                },
+                                "runAfter": {
+                                    "Set_FatalError_On_BadStatus": ["SUCCEEDED"]
+                                }
+                            }
+                        },
+                        "else": {
+                            "actions": {}
+                        },
+                        "runAfter": {
+                            "GitLab_Request": ["SUCCEEDED"]
+                        }
+                    },
+                    "If_NoError": {
+                        "type": "If",
+                        "expression": "@equals(variables('fatalError'), '')",
+                        "actions": {
+                            "Set_NextPage": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "nextPage",
+                                    "value": "@coalesce(outputs('GitLab_Request')?['headers']?['x-next-page'], outputs('GitLab_Request')?['headers']?['X-Next-Page'], '')"
+                                }
+                            },
+                            "If_Empty_Stop": {
+                                "type": "If",
+                                "expression": "@equals(length(body('GitLab_Request')), 0)",
+                                "actions": {
+                                    "Stop": {
+                                        "type": "SetVariable",
+                                        "inputs": {
+                                            "name": "nextPage",
+                                            "value": "''"
+                                        }
+                                    }
+                                },
+                                "else": {
+                                    "actions": {}
+                                },
+                                "runAfter": {
+                                    "Set_NextPage": ["SUCCEEDED"]
+                                }
+                            },
+                            "Map_Documents": {
+                                "type": "Select",
+                                "inputs": {
+                                    "from": "@if(startsWith(string(body('GitLab_Request')),'['), body('GitLab_Request'), createArray(body('GitLab_Request')))",
+                                    "select": {
+                                        "EventId": "@string(item()['id'])",
+                                        "EventTime": "@formatDateTime(coalesce(item()?['created_at'], utcNow()), 'yyyy-MM-ddTHH:mm:ssZ')",
+                                        "Action": "@coalesce(item()?['event_name'], item()?['event_type'], item()?['action'], item()?['details']?['event_name'])",
+                                        "AuthorName": "@coalesce(item()?['details']?['author_name'], item()?['author_name'], item()?['author']?['name'])",
+                                        "AuthorUsername": "@coalesce(item()?['author_username'], item()?['author']?['username'])",
+                                        "AuthorId": "@coalesce(item()?['author_id'], item()?['author']?['id'], item()?['details']?['author_id'])",
+                                        "EntityType": "@coalesce(item()?['entity_type'], item()?['target_type'])",
+                                        "EntityId": "@coalesce(item()?['entity_id'], item()?['target_id'])",
+                                        "EntityPath": "@coalesce(item()?['entity_path'], item()?['details']?['entity_path'])",
+                                        "TargetType": "@coalesce(item()?['target_type'], item()?['details']?['target_type'])",
+                                        "TargetId": "@coalesce(item()?['target_id'], item()?['details']?['target_id'])",
+                                        "TargetDetails": "@coalesce(item()?['target_details'], item()?['details']?['target_details'], string(item()?['details']?['target']))",
+                                        "IpAddress": "@coalesce(item()?['ip_address'], item()?['details']?['ip_address'])",
+                                        "CustomMessage": "@coalesce(item()?['details']?['custom_message'], '')",
+                                        "RawDetails": "@string(coalesce(item()?['details'], null))",
+                                        "Raw": "@string(item())"
+                                    }
+                                },
+                                "runAfter": {
+                                    "If_Empty_Stop": ["SUCCEEDED"]
+                                }
+                            },
+                            "Compute_MaxTime": {
+                                "type": "Compose",
+                                "inputs": "@if(greater(length(body('Map_Documents')), 0), if(greater(ticks(first(body('Map_Documents'))['EventTime']), ticks(variables('maxTime'))), first(body('Map_Documents'))['EventTime'], variables('maxTime')), variables('maxTime'))",
+                                "runAfter": {
+                                    "Map_Documents": ["SUCCEEDED"]
+                                }
+                            },
+                            "Set_MaxTime": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "maxTime",
+                                    "value": "@outputs('Compute_MaxTime')"
+                                },
+                                "runAfter": {
+                                    "Compute_MaxTime": ["SUCCEEDED"]
+                                }
+                            },
+                            "If_Has_Records": {
+                                "type": "If",
+                                "expression": "@greater(length(body('Map_Documents')), 0)",
+                                "actions": {
+                                    "POST_to_DCR": {
+                                        "type": "Http",
+                                        "inputs": {
+                                            "uri": "@{parameters('dcrEndpoint')}/dataCollectionRules/@{parameters('dcrImmutableId')}/streams/@{parameters('streamName')}?api-version=2023-01-01",
+                                            "method": "POST",
+                                            "headers": {
+                                                "Content-Type": "application/json"
+                                            },
+                                            "body": "@body('Map_Documents')",
+                                            "authentication": {
+                                                "type": "ManagedServiceIdentity",
+                                                "audience": "https://monitor.azure.com/"
+                                            },
+                                            "timeout": "PT30S",
+                                            "retryPolicy": {
+                                                "type": "exponential",
+                                                "count": 3,
+                                                "interval": "PT10S"
+                                            }
+                                        }
+                                    }
+                                },
+                                "else": {
+                                    "actions": {}
+                                },
+                                "runAfter": {
+                                    "Set_MaxTime": ["SUCCEEDED"]
+                                }
+                            },
+                            "Compute_Next_Page": {
+                                "type": "Compose",
+                                "inputs": "@add(variables('page'), 1)",
+                                "runAfter": {
+                                    "If_Has_Records": ["SUCCEEDED"]
+                                }
+                            },
+                            "Advance_Page": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "page",
+                                    "value": "@outputs('Compute_Next_Page')"
+                                },
+                                "runAfter": {
+                                    "Compute_Next_Page": ["SUCCEEDED"]
+                                }
+                            }
+                        },
+                        "else": {
+                            "actions": {}
+                        },
+                        "runAfter": {
+                            "If_Http_BadStatus": ["SUCCEEDED"]
+                        }
+                    }
+                },
+                "runAfter": {
+                    "Init_MaxTime": ["SUCCEEDED"]
+                }
+            },
+            "Add_One_Second_To_MaxTime": {
+                "type": "Compose",
+                "inputs": "@formatDateTime(addSeconds(variables('maxTime'), 1), 'yyyy-MM-ddTHH:mm:ssZ')",
+                "runAfter": {
+                    "Until_Paginate": ["SUCCEEDED"]
+                }
+            },
+            "Update_LastTime": {
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://@{parameters('keyVaultName')}.vault.azure.net/secrets/@{parameters('checkpointSecretName')}?api-version=7.4",
+                    "method": "PUT",
+                    "headers": {
+                        "Content-Type": "application/json"
+                    },
+                    "body": {
+                        "value": "@outputs('Add_One_Second_To_MaxTime')"
+                    },
+                    "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://vault.azure.net"
+                    }
+                },
+                "runAfter": {
+                    "Add_One_Second_To_MaxTime": ["SUCCEEDED"]
+                }
+            },
+            "Terminate_If_Fatal": {
+                "type": "If",
+                "expression": "@not(equals(variables('fatalError'), ''))",
+                "actions": {
+                    "Terminate_After_Loop": {
+                        "type": "Terminate",
+                        "inputs": {
+                            "runStatus": "Failed",
+                            "runError": {
+                                "code": "GitLabHttpError",
+                                "message": "@{variables('fatalError')}"
+                            }
+                        }
+                    }
+                },
+                "else": {
+                    "actions": {}
+                },
+                "runAfter": {
+                    "Update_LastTime": ["SUCCEEDED"]
+                }
+            }
+        },
+        "outputs": {},
+        "triggers": {
+            "Recurrence": {
+                "type": "Recurrence",
+                "recurrence": {
+                    "interval": 10,
+                    "frequency": "Minute"
+                }
+            }
+        }
+    },
+    "kind": "Stateful"
+}
